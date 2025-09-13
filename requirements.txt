@@ -1,8 +1,9 @@
 gymnax
-evosax
+evosax==0.1.6
 optax
 dotmap
 tqdm
 numpy
 matplotlib
 pyyaml
+tensorflow_probability
