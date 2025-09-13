@@ -73,8 +73,15 @@ if __name__ == "__main__":
     )
     args, _ = parser.parse_known_args()
     config = load_config(args.config_fname, args.seed_id, args.lrate)
-    main(
-        config.train_config,
-        mle_log=None,
-        log_ext=str(args.lrate) if args.lrate != 5e-04 else "",
-    )
+    # Example of running experiments with different pseudo rewards
+    pseudo_reward_types = ["none", "displacement", "displacement_pbs", "max_displacement_bampf"]
+
+    for pr_type in pseudo_reward_types:
+        config.train_config.pseudo_reward_type = pr_type
+        log_ext = f"_{pr_type}_seed{config.train_config.seed_id}"
+        main(config.train_config, mle_log=None, log_ext=log_ext)
+    # main(
+    #     config.train_config,
+    #     mle_log=None,
+    #     log_ext=str(args.lrate) if args.lrate != 5e-04 else "",
+    # )

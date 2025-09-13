@@ -9,6 +9,8 @@ from flax.training.train_state import TrainState
 import numpy as np
 import tqdm
 import gymnax
+from .pseudo_rewards import PseudoRewardWrapper
+from .episode_logger import EpisodeLogger
 
 
 class BatchManager:
@@ -219,9 +221,26 @@ def train_ppo(rng, config, model, params, mle_log):
         params=params,
         tx=tx,
     )
+    
     # Setup the rollout manager -> Collects data in vmapped-fashion over envs
     rollout_manager = RolloutManager(
         model, config.env_name, config.env_kwargs, config.env_params
+    )
+
+    # Initialize pseudo reward wrapper
+    pseudo_reward_wrapper = PseudoRewardWrapper(
+        pseudo_reward_type=config.get('pseudo_reward_type', 'none'),
+        num_envs=config.num_train_envs,
+        gamma=config.gamma,
+        max_episode_steps=rollout_manager.env_params.max_steps_in_episode
+    )
+    
+    # Initialize episode logger
+    episode_logger = EpisodeLogger(
+        log_dir=config.get('episode_log_dir', './episode_logs'),
+        env_name=config.env_name,
+        seed=config.seed_id,
+        pseudo_reward_type=config.get('pseudo_reward_type', 'none')
     )
 
     batch_manager = BatchManager(
@@ -234,7 +253,7 @@ def train_ppo(rng, config, model, params, mle_log):
     )
 
     @partial(jax.jit, static_argnums=5)
-    def get_transition(
+    def get_transition_jit(
         train_state: TrainState,
         obs: jnp.ndarray,
         state: dict,
@@ -245,17 +264,16 @@ def train_ppo(rng, config, model, params, mle_log):
         action, log_pi, value, new_key = rollout_manager.select_action(
             train_state, obs, rng
         )
-        # print(action.shape)
         new_key, key_step = jax.random.split(new_key)
         b_rng = jax.random.split(key_step, num_train_envs)
+        
         # Automatic env resetting in gymnax step!
-        next_obs, next_state, reward, done, _ = rollout_manager.batch_step(
+        next_obs, next_state, env_reward, done, info = rollout_manager.batch_step(
             b_rng, state, action
         )
-        batch = batch_manager.append(
-            batch, obs, action, reward, done, log_pi, value
-        )
-        return train_state, next_obs, next_state, batch, new_key
+        
+        # Don't compute pseudo rewards here - return data for computation outside JIT
+        return train_state, next_obs, next_state, batch, new_key, env_reward, done, obs, action, log_pi, value
 
     batch = batch_manager.reset()
 
@@ -267,8 +285,10 @@ def train_ppo(rng, config, model, params, mle_log):
     total_steps = 0
     log_steps, log_return = [], []
     t = tqdm.tqdm(range(1, num_total_epochs + 1), desc="PPO", leave=True)
+    
     for step in t:
-        train_state, obs, state, batch, rng_step = get_transition(
+        # Get transition data from JIT function
+        train_state, next_obs, next_state, batch, rng_step, env_reward, done, prev_obs, action, log_pi, value = get_transition_jit(
             train_state,
             obs,
             state,
@@ -276,7 +296,32 @@ def train_ppo(rng, config, model, params, mle_log):
             rng_step,
             config.num_train_envs,
         )
+        
+        # Compute pseudo rewards outside of JIT
+        pseudo_reward = pseudo_reward_wrapper.compute_pseudo_reward(
+            prev_obs, action, next_obs, done, {}
+        )
+        
+        # Combine rewards and update batch
+        total_reward = env_reward + pseudo_reward
+        batch = batch_manager.append(
+            batch, prev_obs, action, total_reward, done, log_pi, value
+        )
+        
+        # Update episode logger
+        episode_logger.update_episodes(
+            env_rewards=np.array(env_reward),
+            pseudo_rewards=np.array(pseudo_reward),
+            dones=np.array(done),
+            env_ids=np.arange(config.num_train_envs)
+        )
+        
+        # Update state for next iteration
+        obs = next_obs
+        state = next_state
+        
         total_steps += config.num_train_envs
+        
         if step % (config.n_steps + 1) == 0:
             metric_dict, train_state, rng_update = update(
                 train_state,
@@ -311,6 +356,9 @@ def train_ppo(rng, config, model, params, mle_log):
                     model=train_state.params,
                     save=True,
                 )
+    
+    # Save episode logs at the end of training
+    episode_logger.save_logs()
 
     return (
         log_steps,
